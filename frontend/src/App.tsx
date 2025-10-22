@@ -11,6 +11,7 @@ interface Slip {
   suffix: string
   used: boolean
   address: string
+  hashHex: string
   memo: string
   tokenKey: string
   tokenTxid: string
@@ -38,8 +39,7 @@ function App() {
   // ----- Incoming tab (new UI around your existing logic)
   const [depositSlips, setDepositSlips] = useState<Array<Slip>>([])
   const [newSlipMemo, setNewSlipMemo] = useState('')
-  const [expandedSlipIndex, setExpandedSlipIndex] = useState<number | null>(null)
-  const [incomingBEEF, setIncomingBEEF] = useState('') // text area paste per slip (bound to expanded slip)
+  const [incomingBEEFs, setIncomingBEEFs] = useState('') // global textarea for Atomic BEEF values
   const [isDepositing, setIsDepositing] = useState(false)
 
   // ----- Global UI
@@ -73,12 +73,15 @@ function App() {
               keyID: `${prefix} ${suffix}`,
               counterparty: me
             })
+            const derivedPK = PublicKey.fromString(publicKey)
+            const hashHex = derivedPK.toHash('hex') as string
 
             parsed.push({
               prefix,
               suffix,
               used: fields[SLIP_DROP.used][0] !== 0,
-              address: PublicKey.fromString(publicKey).toAddress(),
+              address: derivedPK.toAddress(),
+              hashHex,
               memo: Utils.toUTF8(fields[SLIP_DROP.memo]),
               tokenKey,
               tokenTxid,
@@ -131,6 +134,8 @@ function App() {
         keyID: `${prefixStr} ${suffixStr}`,
         counterparty: me
       })
+      const derivedPK = PublicKey.fromString(publicKey)
+      const hashHex = derivedPK.toHash('hex') as string
 
       setDepositSlips((old) => [
         ...old,
@@ -140,7 +145,8 @@ function App() {
           used: false,
           memo,
           tokenKey,
-          address: PublicKey.fromString(publicKey).toAddress(),
+          address: derivedPK.toAddress(),
+          hashHex,
           tokenTxid: txid as string,
           tokenOutputIndex: 0,
           tokenBEEF: tx as number[]
@@ -152,112 +158,200 @@ function App() {
     }
   }
 
-  // Deposit pasted Atomic BEEF into the selected slip (keeps your logic)
-  const makeDeposit = async (atomicBEEF: string, slipIndex: number) => {
+  const markSlipAsUsed = async (slip: Slip) => {
+    const newSlipScript = await new PushDrop(wallet).lock(
+      [
+        Utils.toArray(slip.prefix, 'base64'),
+        Utils.toArray(slip.suffix, 'base64'),
+        [1],
+        Utils.toArray(slip.memo, 'utf8')
+      ],
+      SLIP_PROTOCOL,
+      slip.tokenKey,
+      'self'
+    )
+
+    const { signableTransaction } = await wallet.createAction({
+      description: 'mark deposit slip as used',
+      inputBEEF: slip.tokenBEEF,
+      inputs: [{
+        outpoint: `${slip.tokenTxid}.${slip.tokenOutputIndex}`,
+        unlockingScriptLength: 74,
+        inputDescription: 'Consume old deposit slip'
+      }],
+      outputs: [{
+        outputDescription: 'Deposit slip',
+        satoshis: 1,
+        lockingScript: newSlipScript.toHex(),
+        basket: 'deposit slips',
+        customInstructions: JSON.stringify({ tokenKey: slip.tokenKey })
+      }],
+      options: { acceptDelayedBroadcast: false, randomizeOutputs: false }
+    })
+
+    const unlocker = new PushDrop(wallet).unlock(SLIP_PROTOCOL, slip.tokenKey, 'self')
+    await wallet.signAction({
+      reference: signableTransaction?.reference as string,
+      spends: {
+        0: {
+          unlockingScript: (
+            await unlocker.sign(
+              Transaction.fromAtomicBEEF(signableTransaction?.tx as number[]),
+              0
+            )
+          ).toHex()
+        }
+      }
+    })
+  }
+
+  const depositAtomicBEEFs = async () => {
+    const rawInput = incomingBEEFs.trim()
+    if (!rawInput) return
+
     setIsDepositing(true)
     setError(null)
-    try {
-      const atomicArray = Utils.toArray(atomicBEEF, 'hex') as number[]
-      const slip = depositSlips[slipIndex] as Slip
-      const tx = Transaction.fromAtomicBEEF(atomicArray)
 
-      const { publicKey: me } = await wallet.getPublicKey({ identityKey: true })
-      const { publicKey } = await anyone.getPublicKey({
-        protocolID: [2, '3241645161d8'],
-        keyID: `${slip.prefix} ${slip.suffix}`,
-        counterparty: me
+    const candidates = rawInput.split(/\s+/).map(v => v.trim()).filter(Boolean)
+    if (!candidates.length) {
+      setIsDepositing(false)
+      return
+    }
+
+    const slipMap = new Map<string, { slip: Slip, index: number }>()
+    depositSlips.forEach((slip, index) => {
+      slipMap.set(slip.hashHex, { slip, index })
+    })
+
+    const plans: Array<{
+      raw: string
+      atomic: number[]
+      matches: Array<{ slip: Slip, index: number, outputIndex: number }>
+    }> = []
+    const parseFailures: string[] = []
+    const unmatched: string[] = []
+
+    for (const raw of candidates) {
+      try {
+        const atomic = Utils.toArray(raw, 'hex') as number[]
+        const tx = Transaction.fromAtomicBEEF(atomic)
+        const matches: Array<{ slip: Slip, index: number, outputIndex: number }> = []
+
+        tx.outputs.forEach((output, outputIndex) => {
+          if (output.lockingScript.chunks.length < 5) return
+          const pkh = output.lockingScript.chunks[2]?.data as number[] | undefined
+          if (!Array.isArray(pkh) || pkh.length !== 20) return
+          const hashHex = Utils.toHex(pkh)
+          const match = slipMap.get(hashHex)
+          if (!match) return
+          matches.push({ slip: match.slip, index: match.index, outputIndex })
+        })
+
+        if (!matches.length) {
+          unmatched.push(raw)
+          continue
+        }
+
+        plans.push({ raw, atomic, matches })
+      } catch {
+        parseFailures.push(raw)
+      }
+    }
+
+    if (!plans.length) {
+      const notices: string[] = []
+      if (parseFailures.length) {
+        notices.push(`${parseFailures.length} Atomic BEEF value${parseFailures.length > 1 ? 's' : ''} could not be parsed.`)
+      }
+      if (unmatched.length) {
+        notices.push(`${unmatched.length} Atomic BEEF value${unmatched.length > 1 ? 's' : ''} did not match any deposit slip.`)
+      }
+      if (!notices.length) {
+        notices.push('No deposit slips matched the provided Atomic BEEF.')
+      }
+      setError(notices.join(' '))
+      setIsDepositing(false)
+      return
+    }
+
+    const usedWarnings = new Set<string>()
+    plans.forEach(plan => {
+      plan.matches.forEach(({ slip }) => {
+        if (slip.used) usedWarnings.add(slip.address)
       })
+    })
 
-      const correctPKHHex = PublicKey.fromString(publicKey).toHash('hex')
-
-      const foundOutputIndex = tx.outputs.findIndex(o => {
-        if (o.lockingScript.chunks.length < 5) return false
-        const pkh = o.lockingScript.chunks[2].data as number[]
-        if (!Array.isArray(pkh)) return false
-        if (pkh.length !== 20) return false
-        return Utils.toHex(pkh) === correctPKHHex
-      })
-
-      if (foundOutputIndex === -1) {
-        setError('No output from this transaction pays this deposit slip.')
+    if (usedWarnings.size) {
+      const proceed = window.confirm(
+        [
+          'Some deposit slips are already marked USED:',
+          ...Array.from(usedWarnings).map(addr => `• ${addr}`),
+          'Continue with the deposit?'
+        ].join('\n')
+      )
+      if (!proceed) {
         setIsDepositing(false)
         return
       }
+    }
 
-      await wallet.internalizeAction({
-        tx: atomicArray,
-        description: 'Deposit funds from deposit slip',
-        outputs: [{
-          outputIndex: foundOutputIndex,
-          protocol: 'wallet payment',
-          paymentRemittance: {
-            derivationPrefix: slip.prefix,
-            derivationSuffix: slip.suffix,
-            senderIdentityKey: anyone.keyDeriver?.identityKey as string
-          }
-        }]
-      })
+    const markIndices = new Set<number>()
+    try {
+      for (const plan of plans) {
+        await wallet.internalizeAction({
+          tx: plan.atomic,
+          description: 'Deposit funds from deposit slip',
+          outputs: plan.matches.map(({ slip, outputIndex }) => ({
+            outputIndex,
+            protocol: 'wallet payment',
+            paymentRemittance: {
+              derivationPrefix: slip.prefix,
+              derivationSuffix: slip.suffix,
+              senderIdentityKey: anyone.keyDeriver?.identityKey as string
+            }
+          }))
+        })
 
-      // Mark slip as used (on-chain update)
-      const newSlipScript = await new PushDrop(wallet).lock(
-        [
-          Utils.toArray(slip.prefix, 'base64'),
-          Utils.toArray(slip.suffix, 'base64'),
-          [1],
-          Utils.toArray(slip.memo, 'utf8')
-        ],
-        SLIP_PROTOCOL,
-        slip.tokenKey,
-        'self'
-      )
-
-      const { signableTransaction } = await wallet.createAction({
-        description: 'mark deposit slip as used',
-        inputBEEF: slip.tokenBEEF,
-        inputs: [{
-          outpoint: `${slip.tokenTxid}.${slip.tokenOutputIndex}`,
-          unlockingScriptLength: 74,
-          inputDescription: 'Consume old deposit slip'
-        }],
-        outputs: [{
-          outputDescription: 'Deposit slip',
-          satoshis: 1,
-          lockingScript: newSlipScript.toHex(),
-          basket: 'deposit slips',
-          customInstructions: JSON.stringify({ tokenKey: slip.tokenKey })
-        }],
-        options: { acceptDelayedBroadcast: false, randomizeOutputs: false }
-      })
-
-      const unlocker = new PushDrop(wallet).unlock(SLIP_PROTOCOL, slip.tokenKey, 'self')
-      await wallet.signAction({
-        reference: signableTransaction?.reference as string,
-        spends: {
-          0: {
-            unlockingScript: (
-              await unlocker.sign(
-                Transaction.fromAtomicBEEF(signableTransaction?.tx as number[]),
-                0
-              )
-            ).toHex()
-          }
-        }
-      })
-
-      // Optimistic UI: flag as used
-      setDepositSlips(prev => {
-        const clone = [...prev]
-        if (clone[slipIndex]) clone[slipIndex].used = true
-        return clone
-      })
-
-      setIncomingBEEF('')
-      setExpandedSlipIndex(null)
+        plan.matches.forEach(({ slip, index }) => {
+          if (!slip.used) markIndices.add(index)
+        })
+      }
     } catch (e: any) {
       setError(e?.message || 'Failed to deposit Atomic BEEF.')
-    } finally {
       setIsDepositing(false)
+      return
     }
+
+    const updatedSlips = [...depositSlips]
+    const markErrors: string[] = []
+
+    for (const index of markIndices) {
+      const slip = updatedSlips[index]
+      if (!slip) continue
+      try {
+        await markSlipAsUsed(slip)
+        updatedSlips[index] = { ...slip, used: true }
+      } catch (e: any) {
+        markErrors.push(e?.message || `Failed to mark slip ${slip.address} as used.`)
+      }
+    }
+
+    setDepositSlips(updatedSlips)
+    setIncomingBEEFs('')
+
+    const warnings: string[] = []
+    if (parseFailures.length) {
+      warnings.push(`${parseFailures.length} Atomic BEEF value${parseFailures.length > 1 ? 's' : ''} could not be parsed.`)
+    }
+    if (unmatched.length) {
+      warnings.push(`${unmatched.length} Atomic BEEF value${unmatched.length > 1 ? 's' : ''} did not match any deposit slip.`)
+    }
+    if (markErrors.length) {
+      warnings.push(...markErrors)
+    }
+
+    setError(warnings.length ? warnings.join(' ') : null)
+    setIsDepositing(false)
   }
 
   // Outgoing funding (unchanged logic)
@@ -464,6 +558,37 @@ function App() {
               </div>
             </div>
 
+            <label className="label">
+              Atomic BEEF deposits
+              <textarea
+                className="textarea"
+                placeholder="Paste one or more hex-encoded Atomic BEEFs. Separate multiple values with spaces or new lines."
+                value={incomingBEEFs}
+                onChange={(e) => setIncomingBEEFs(e.target.value)}
+              />
+            </label>
+            <div className="actions-row">
+              <button
+                className={`primary ${!incomingBEEFs.trim() || isDepositing ? 'disabled' : ''}`}
+                disabled={!incomingBEEFs.trim() || isDepositing}
+                onClick={depositAtomicBEEFs}
+              >
+                {isDepositing ? (
+                  <span className="spinner-wrap"><span className="spinner" /> Depositing…</span>
+                ) : (
+                  'Deposit to Wallet'
+                )}
+              </button>
+              <button
+                className="ghost"
+                onClick={() => setIncomingBEEFs('')}
+                disabled={!incomingBEEFs || isDepositing}
+              >
+                Clear
+              </button>
+              <span className="muted">We’ll match each output to its slip automatically.</span>
+            </div>
+
             <div className="slip-list">
               {sortedSlips.length === 0 && (
                 <div className="empty">No deposit slips yet. Create one above.</div>
@@ -478,7 +603,6 @@ function App() {
                   s.tokenOutputIndex === slip.tokenOutputIndex
                 )
 
-                const isExpanded = expandedSlipIndex === realIndex
                 const warnReuse = slip.used
 
                 return (
@@ -512,7 +636,7 @@ function App() {
                           disabled={!slip.address}
                           title="Copy address"
                         >
-                          {copied === `slip-${realIndex}` ? '✓ Copied' : 'Copy'}
+                          {copied === `slip-${realIndex}` ? '✓ Copied' : 'Copy Address'}
                         </button>
                         <button
                           className="ghost"
@@ -529,64 +653,8 @@ function App() {
                         >
                           Download
                         </button>
-                        <button
-                          className="primary"
-                          onClick={() => {
-                            // If switching between rows, clear paste area
-                            setIncomingBEEF('')
-                            setExpandedSlipIndex(isExpanded ? null : realIndex)
-                          }}
-                        >
-                          {isExpanded ? 'Close' : 'Deposit Atomic BEEF'}
-                        </button>
                       </div>
                     </div>
-
-                    {isExpanded && (
-                      <div className="slip-expand">
-                        {warnReuse && (
-                          <div className="warning">
-                            <strong>Warning:</strong> this slip is marked <strong>USED</strong>. Reusing harms privacy and is discouraged.
-                          </div>
-                        )}
-
-                        <div className="label">Paste Atomic BEEF</div>
-                        <textarea
-                          className="textarea"
-                          placeholder="Hex-encoded Atomic BEEF that pays the slip’s address…"
-                          value={incomingBEEF}
-                          onChange={(e) => setIncomingBEEF(e.target.value.trim())}
-                        />
-                        <div className="actions-row">
-                          <button
-                            className={`primary ${!incomingBEEF || isDepositing ? 'disabled' : ''}`}
-                            disabled={!incomingBEEF || isDepositing}
-                            onClick={() => {
-                              if (warnReuse) {
-                                const ok = window.confirm(
-                                  'This slip is already used. Are you sure you want to attempt another deposit to it?'
-                                )
-                                if (!ok) return
-                              }
-                              makeDeposit(incomingBEEF, realIndex)
-                            }}
-                          >
-                            {isDepositing ? (
-                              <span className="spinner-wrap"><span className="spinner" /> Depositing…</span>
-                            ) : (
-                              'Deposit to Wallet'
-                            )}
-                          </button>
-                          <button
-                            className="ghost"
-                            onClick={() => setIncomingBEEF('')}
-                            disabled={!incomingBEEF || isDepositing}
-                          >
-                            Clear
-                          </button>
-                        </div>
-                      </div>
-                    )}
                   </div>
                 )
               })}
@@ -608,45 +676,61 @@ function App() {
       <strong>Goal:</strong> Move funds between “Metanet Client” (MNC) and anyone—without chain scanning—using <em>Atomic BEEF</em>.
     </div>
 
-    <div className="steps">
-      <h4>Receiving funds (Incoming tab)</h4>
-      <ol>
-        <li><strong>Generate a Deposit Slip.</strong> It creates a fresh address derived from your prefix/suffix (counterparty=<code>anyone</code>).</li>
-        <li><strong>Give the Address</strong> from that slip to the sender.</li>
-        <li><strong>Sender must provide Atomic BEEF.</strong> Ask them to use this Funder app (or any tool that outputs Atomic BEEF) to pay your slip’s address.</li>
-        <li><strong>Paste Atomic BEEF</strong> into the slip’s “Deposit Atomic BEEF” area and click <em>Deposit to Wallet</em>. The slip is then <strong>marked USED</strong>.</li>
-        <li><strong>Privacy note:</strong> Don’t reuse deposit slips. Used slips are pushed to the bottom and clearly warned.</li>
-      </ol>
+    {tab === 'incoming' ? (
+      <>
+        <div className="steps">
+          <h4>Receiving funds (Incoming tab)</h4>
+          <ol>
+            <li><strong>Create a deposit slip.</strong> Each slip derives a fresh address (counterparty=<code>anyone</code>).</li>
+            <li><strong>Share the slip’s address.</strong> The sender can fund it from any tool that outputs Atomic BEEF.</li>
+            <li><strong>Collect Atomic BEEF.</strong> Paste one or more hex strings into the deposit area above—whitespace separation is fine.</li>
+            <li><strong>Deposit to wallet.</strong> The app matches every paying output to its slip automatically and marks unused slips as <strong>USED</strong>.</li>
+            <li><strong>Privacy note:</strong> You’ll be warned before depositing to a slip that’s already marked used. Prefer a fresh slip per payment.</li>
+          </ol>
+        </div>
 
-      <h4>Sending funds (Outgoing tab)</h4>
-      <ol>
-        <li><strong>Enter the recipient’s address</strong> and amount.</li>
-        <li><strong>Click Send</strong> and you’ll get an <em>Atomic BEEF</em> for that spend.</li>
-        <li><strong>Give the Atomic BEEF</strong> to the recipient. They can internalize it without any third-party scanners.</li>
-      </ol>
-    </div>
+        <div className="callout info">
+          <strong>What if the sender’s wallet doesn’t give Atomic BEEF?</strong><br />
+          Best practice is for wallets to include Atomic BEEF when they pay you. If they can’t, you may fall back to a chain-scanning service, but it <strong>reduces privacy</strong> and adds third-party reliance.
+        </div>
 
-    <div className="callout info">
-      <strong>What if the sender’s wallet doesn’t give Atomic BEEF?</strong><br />
-      Best practice is for wallets to include Atomic BEEF when sending to an address. If they can’t, the recipient can fall back to a chain-scanning service as a last resort, but it <strong>reduces privacy</strong> and adds third-party reliance. Encourage senders to use tools that export Atomic BEEF.
-    </div>
+        <div className="steps">
+          <h4>Exporting a deposit slip</h4>
+          <ul>
+            <li>Use <em>Download</em> to save a <code>.txt</code> file with the address and setup details.</li>
+            <li>Exporting an already <strong>USED</strong> slip is allowed but discouraged for new funding rounds.</li>
+          </ul>
+        </div>
 
-    <div className="steps">
-      <h4>Exporting a Deposit Slip</h4>
-      <ul>
-        <li>Use <em>Download</em> on a slip to save a <code>.txt</code> with address + instructions.</li>
-        <li>Downloading a <strong>USED</strong> slip is allowed but warned—avoid reuse to preserve privacy.</li>
-      </ul>
-    </div>
+        <div className="callout warn">
+          <strong>Warnings</strong>
+          <ul>
+            <li>Reusing deposit slips harms privacy and may link activity.</li>
+            <li>Only deposit Atomic BEEF that actually pays the slip’s address—otherwise it will be rejected.</li>
+            <li>Keep exported files safe; they contain derivation hints.</li>
+          </ul>
+        </div>
+      </>
+    ) : (
+      <>
+        <div className="steps">
+          <h4>Sending funds (Outgoing tab)</h4>
+          <ol>
+            <li><strong>Enter the recipient’s address</strong> and amount in satoshis.</li>
+            <li><strong>Click Send</strong> to build the transaction and copy the generated Atomic BEEF.</li>
+            <li><strong>Share the Atomic BEEF</strong> with the recipient so they can internalize it without chain scanning.</li>
+          </ol>
+        </div>
 
-    <div className="callout warn">
-      <strong>Warnings</strong>
-      <ul>
-        <li>Reusing deposit slips harms privacy and may link activity.</li>
-        <li>Only deposit Atomic BEEF that actually pays the slip’s address—otherwise it will be rejected.</li>
-        <li>Keep your exported files safe. They may contain derivation hints and workflow guidance.</li>
-      </ul>
-    </div>
+        <div className="callout info">
+          <strong>Tip:</strong> Any outputs you include can land on multiple slips. Encourage recipients to keep slips fresh for privacy.
+        </div>
+
+        <div className="callout warn">
+          <strong>Reminder:</strong> Atomic BEEF is the signed transaction. Only hand it to the intended recipient.
+        </div>
+      </>
+    )}
   </div>
 </details>
 
