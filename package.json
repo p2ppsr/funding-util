@@ -16,7 +16,7 @@
     "typescript": "^5.8.3"
   },
   "dependencies": {
-    "@bsv/cars-cli": "^1.2.9",
-    "@bsv/lars": "^1.5.6"
+    "@p2ppsr/cars-cli": "^1.2.13",
+    "@p2ppsr/lars": "^1.5.11"
   }
 }
